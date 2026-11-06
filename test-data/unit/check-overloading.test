@@ -7046,3 +7046,67 @@ reveal_type(f(la))  # N: Revealed type is "builtins.list[builtins.tuple[Any, ...
 reveal_type(f(li))  # N: Revealed type is "builtins.list[builtins.tuple[builtins.int, ...]]"
 reveal_type(f(ls))  # N: Revealed type is "builtins.list[builtins.tuple[Any, ...]]"
 [builtins fixtures/tuple.pyi]
+
+[case testOverloadExpandsBoolArgument]
+from typing import Literal, Union, overload
+
+@overload
+def foo(x: Literal[True]) -> int: ...
+@overload
+def foo(x: Literal[False]) -> str: ...
+def foo(x: bool) -> Union[int, str]: ...
+
+reveal_type(foo(True))  # N: Revealed type is "builtins.int"
+reveal_type(foo(False))  # N: Revealed type is "builtins.str"
+b: bool
+reveal_type(foo(b))  # N: Revealed type is "builtins.int | builtins.str"
+o: Union[bool, None]
+foo(o)  # E: No overload variant of "foo" matches argument type "bool | None" \
+        # N: Possible overload variants: \
+        # N:     def foo(x: Literal[True]) -> int \
+        # N:     def foo(x: Literal[False]) -> str
+
+@overload
+def bar(x: Literal[True]) -> int: ...
+@overload
+def bar(x: str) -> str: ...
+def bar(x: object) -> object: ...
+
+bar(b)  # E: No overload variant of "bar" matches argument type "bool" \
+        # N: Possible overload variants: \
+        # N:     def bar(x: Literal[True]) -> int \
+        # N:     def bar(x: str) -> str
+[builtins fixtures/bool.pyi]
+
+[case testOverloadExpandsBoolArgumentMixed]
+from typing import Literal, Union, overload
+
+class A: ...
+class B: ...
+
+@overload
+def f(a: A, *, flag: bool = ...) -> A: ...
+@overload
+def f(a: B, *, flag: Literal[False] = ...) -> B: ...
+@overload
+def f(a: B, *, flag: Literal[True]) -> A: ...
+def f(*args: object, **kwargs: object) -> object: ...
+
+x: Union[A, B]
+b: bool
+reveal_type(f(x, flag=b))  # N: Revealed type is "__main__.A | __main__.B"
+[builtins fixtures/bool.pyi]
+
+[case testOverloadExpandsBoolArgumentNotWithAny]
+# A union containing Any is not expanded, since Any already makes the match ambiguous.
+from typing import Any, Literal, Union, overload
+
+@overload
+def foo(x: Literal[True]) -> int: ...
+@overload
+def foo(x: Literal[False]) -> str: ...
+def foo(x: bool) -> Union[int, str]: ...
+
+a: Union[Any, bool]
+foo(a)  # E: Argument 1 to "foo" has incompatible type "Any | bool"; expected "Literal[True]"
+[builtins fixtures/bool.pyi]
