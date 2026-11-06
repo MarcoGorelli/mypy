@@ -161,6 +161,7 @@ from mypy.typeops import (
     is_literal_type_like,
     make_simplified_union,
     true_only,
+    try_expanding_sum_type_to_union,
     try_getting_str_literals,
     tuple_fallback,
     type_object_type,
@@ -2985,15 +2986,9 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 # Record if we succeeded. Next we need to see if maybe normal procedure
                 # gives a narrower type.
                 if unioned_return:
-                    returns = [u[0] for u in unioned_return]
                     inferred_types = [u[1] for u in unioned_return]
-                    # Note that we use `combine_function_signatures` instead of just returning
-                    # a union of inferred callables because for example a call
-                    # Union[int -> int, str -> str](Union[int, str]) is invalid and
-                    # we don't want to introduce internal inconsistencies.
-                    unioned_result = (
-                        make_simplified_union(returns, context.line, context.column),
-                        self.combine_function_signatures(get_proper_types(inferred_types)),
+                    unioned_result = self.combine_union_overload_results(
+                        unioned_return, context
                     )
 
         # Step 3: We try checking each branch one-by-one.
@@ -3021,14 +3016,32 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 inferred_result = None
         if unioned_result is not None:
             if inferred_types is not None:
-                for inferred_type in inferred_types:
-                    if isinstance(c := get_proper_type(inferred_type), CallableType):
-                        self.chk.warn_deprecated(c.definition, context)
+                self.warn_deprecated_overload_items(inferred_types, context)
             return unioned_result
         if inferred_result is not None:
             if isinstance(c := get_proper_type(inferred_result[1]), CallableType):
                 self.chk.warn_deprecated(c.definition, context)
             return inferred_result
+
+        # Step 3.5: Nothing matched directly. Try expanding 'bool' arguments into
+        #           'Literal[True, False]' and performing union math, so that a 'bool'
+        #           argument matches overloads for Literal[True] and Literal[False].
+        #           See "argument type expansion" in the typing spec.
+        if not union_interrupted:
+            expanded_result = self.expanded_overload_result(
+                plausible_targets,
+                args,
+                arg_types,
+                arg_kinds,
+                arg_names,
+                callable_name,
+                object_type,
+                none_type_var_overlap,
+                callee.bound_args,
+                context,
+            )
+            if expanded_result is not None:
+                return expanded_result
 
         # Step 4: Failure. At this point, we know there is no match. We fall back to trying
         #         to find a somewhat plausible overload target using the erased types
@@ -3309,6 +3322,93 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             ):
                 return True
         return False
+
+    def expanded_overload_result(
+        self,
+        plausible_targets: list[tuple[int, CallableType]],
+        args: list[Expression],
+        arg_types: list[Type],
+        arg_kinds: list[ArgKind],
+        arg_names: Sequence[str | None] | None,
+        callable_name: str | None,
+        object_type: Type | None,
+        none_type_var_overlap: bool,
+        bound_args: list[Type] | None,
+        context: Context,
+    ) -> tuple[Type, Type] | None:
+        """Try matching an overload call after expanding 'bool' arguments.
+
+        Each 'bool' argument is expanded to 'Literal[True, False]', and union math is
+        then used to match each literal against the overload items. Return None if
+        nothing was expanded or if the expanded call doesn't match.
+        """
+        expanded = [self.expand_bool_arg_type(t) for t in arg_types]
+        if all(e is None for e in expanded):
+            return None
+        expanded_types = [t if e is None else e for t, e in zip(arg_types, expanded)]
+        try:
+            with self.msg.filter_errors():
+                unioned_return = self.union_overload_result(
+                    plausible_targets,
+                    args,
+                    expanded_types,
+                    arg_kinds,
+                    arg_names,
+                    callable_name,
+                    object_type,
+                    none_type_var_overlap,
+                    bound_args,
+                    context,
+                )
+        except TooManyUnions:
+            return None
+        if not unioned_return:
+            return None
+        self.warn_deprecated_overload_items([u[1] for u in unioned_return], context)
+        return self.combine_union_overload_results(unioned_return, context)
+
+    def combine_union_overload_results(
+        self, unioned_return: list[tuple[Type, Type]], context: Context
+    ) -> tuple[Type, Type]:
+        """Combine the per-item results of union math into a single call result."""
+        returns = [u[0] for u in unioned_return]
+        inferred_types = [u[1] for u in unioned_return]
+        # Note that we use `combine_function_signatures` instead of just returning
+        # a union of inferred callables because for example a call
+        # Union[int -> int, str -> str](Union[int, str]) is invalid and
+        # we don't want to introduce internal inconsistencies.
+        return (
+            make_simplified_union(returns, context.line, context.column),
+            self.combine_function_signatures(get_proper_types(inferred_types)),
+        )
+
+    def warn_deprecated_overload_items(self, inferred_types: list[Type], context: Context) -> None:
+        for inferred_type in inferred_types:
+            if isinstance(c := get_proper_type(inferred_type), CallableType):
+                self.chk.warn_deprecated(c.definition, context)
+
+    def expand_bool_arg_type(self, typ: Type) -> Type | None:
+        """Expand 'bool' (also within a union) to 'Literal[True, False]'.
+
+        Return None if there is no 'bool' to expand, or if the type contains Any
+        (which already makes overload matching ambiguous, so expanding doesn't help).
+        """
+        proper = get_proper_type(typ)
+        items = get_proper_types(
+            flatten_nested_unions(proper.relevant_items())
+            if isinstance(proper, UnionType)
+            else [proper]
+        )
+        if any(isinstance(item, AnyType) for item in items):
+            return None
+        if not any(
+            isinstance(item, Instance)
+            and item.type.fullname == "builtins.bool"
+            and item.last_known_value is None
+            for item in items
+        ):
+            return None
+        return try_expanding_sum_type_to_union(proper, "builtins.bool")
 
     def union_overload_result(
         self,
